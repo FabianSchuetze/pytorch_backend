@@ -117,10 +117,10 @@ class ModelState : public BackendModel {
   bool EnabledWeightSharing() { return enable_weight_sharing_; }
   const std::vector<std::string>& ModelOutputs() { return output_names_; }
 
-  void SetMemoryFraction()
+  void SetMemoryFraction(float fraction)
   {
     c10::cuda::CUDACachingAllocator::init(1);
-    c10::cuda::CUDACachingAllocator::setMemoryFraction(memory_fraction_, 0);
+    c10::cuda::CUDACachingAllocator::setMemoryFraction(fraction, 0);
   }
 
  private:
@@ -167,6 +167,8 @@ class ModelState : public BackendModel {
   // List of all the outputs specified in the output section of model
   // configuration.
   std::vector<std::string> output_names_;
+
+  BackendConfiguration* backend_config_;
 };
 
 TRITONSERVER_Error*
@@ -202,7 +204,7 @@ ModelState::ModelState(TRITONBACKEND_Model* triton_model)
       enable_weight_sharing_(false), enable_tensor_fuser_pair_({false, true}),
       enable_jit_profiling_pair_({false, true}),
       enable_jit_executor_pair_({false, true}),
-      enable_nvfuser_pair_({false, false}), memory_fraction_(1.0)
+      enable_nvfuser_pair_({false, false}), backend_config_(nullptr)
 {
   output_names_.clear();
 
@@ -221,7 +223,14 @@ ModelState::ModelState(TRITONBACKEND_Model* triton_model)
     output_names_.emplace_back(io_name);
   }
 
-  SetMemoryFraction();
+  TRITONBACKEND_Backend* backend;
+  THROW_IF_BACKEND_MODEL_ERROR(
+      TRITONBACKEND_ModelBackend(triton_model, &backend));
+  void* vstate;
+  THROW_IF_BACKEND_MODEL_ERROR(TRITONBACKEND_BackendState(backend, &vstate));
+  backend_config_ = reinterpret_cast<BackendConfiguration*>(vstate);
+
+  SetMemoryFraction(backend_config_->gpu_memory_fraction_);
 }
 
 TRITONSERVER_Error*
