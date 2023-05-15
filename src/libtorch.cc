@@ -25,7 +25,9 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <stdint.h>
+
 #include <exception>
+
 #include "libtorch_utils.h"
 #include "triton/backend/backend_common.h"
 #include "triton/backend/backend_input_collector.h"
@@ -58,6 +60,17 @@
 //
 
 namespace triton { namespace backend { namespace pytorch {
+
+struct BackendConfiguration {
+  BackendConfiguration() : gpu_memory_fraction_(1.0) {}
+  float gpu_memory_fraction_;
+};
+
+float
+clamp(float inp, float lo, float high)
+{
+  return (inp < lo) ? lo : (high < inp) ? high : inp;
+}
 
 //
 // ModelState
@@ -104,6 +117,12 @@ class ModelState : public BackendModel {
   bool EnabledWeightSharing() { return enable_weight_sharing_; }
   const std::vector<std::string>& ModelOutputs() { return output_names_; }
 
+  void SetMemoryFraction()
+  {
+    c10::cuda::CUDACachingAllocator::init(1);
+    c10::cuda::CUDACachingAllocator::setMemoryFraction(memory_fraction_, 0);
+  }
+
  private:
   ModelState(TRITONBACKEND_Model* triton_model);
   TRITONSERVER_Error* AutoCompleteConfig();
@@ -123,6 +142,9 @@ class ModelState : public BackendModel {
 
   // Flag to indicate whether weight sharing is enabled. Defaults to false.
   bool enable_weight_sharing_;
+
+  // Specfied the max gpu memory fraction allocatable by pytorch
+  float memory_fraction_;
 
   // Flag pairs to indicate if various JIT settings are set and
   // enabled respectively. Defaults to (false, true). Default behavior
@@ -180,7 +202,7 @@ ModelState::ModelState(TRITONBACKEND_Model* triton_model)
       enable_weight_sharing_(false), enable_tensor_fuser_pair_({false, true}),
       enable_jit_profiling_pair_({false, true}),
       enable_jit_executor_pair_({false, true}),
-      enable_nvfuser_pair_({false, false})
+      enable_nvfuser_pair_({false, false}), memory_fraction_(1.0)
 {
   output_names_.clear();
 
@@ -198,6 +220,8 @@ ModelState::ModelState(TRITONBACKEND_Model* triton_model)
         io.MemberAsString("name", &io_name, &io_name_len));
     output_names_.emplace_back(io_name);
   }
+
+  SetMemoryFraction();
 }
 
 TRITONSERVER_Error*
@@ -259,7 +283,7 @@ ModelState::LoadModel(
   catch (const std::exception& ex) {
     return TRITONSERVER_ErrorNew(
         TRITONSERVER_ERROR_INTERNAL,
-        ("failed to load model '" + Name() + "': " + ex.what()).c_str());
+        ("failed to load model '" + Name()).c_str());
   }
 
   if (enable_weight_sharing_) {
@@ -454,13 +478,50 @@ ModelState::ParseParameters()
                                   " for model instance '" + Name() + "'")
                                      .c_str());
     }
+    LOG_MESSAGE(
+        TRITONSERVER_LOG_INFO, (std::string("Before memory config")).c_str());
+    double memory_fraction = 1.0;
+    err = ParseParameter(params, "MEMORY_FRACTION", &memory_fraction);
+    if (err != nullptr) {
+      if (TRITONSERVER_ErrorCode(err) != TRITONSERVER_ERROR_NOT_FOUND) {
+        return err;
+      } else {
+        LOG_MESSAGE(
+            TRITONSERVER_LOG_INFO,
+            (std::string("Max GPU memory fraction is not specified") +
+             " for model instance '" + Name() + "'")
+                .c_str());
+        TRITONSERVER_ErrorDelete(err);
+      }
+    } else {
+      if ((memory_fraction < 0) or (memory_fraction > 1)) {
+        LOG_MESSAGE(
+            TRITONSERVER_LOG_INFO,
+            (std::string("Memory fraction must be between zero and one "
+                         "(inclusive) but is set to ") +
+             std::to_string(memory_fraction) + " for model instance '" +
+             Name() + "Will clamp to valid interval.'")
+                .c_str());
+      }
+      memory_fraction_ = float(clamp(memory_fraction, 0.0, 1.0));
+      LOG_MESSAGE(
+          TRITONSERVER_LOG_INFO, (std::string("Memory fraction set to ") +
+                                  std::to_string(memory_fraction_) +
+                                  " for model instance '" + Name() + "'")
+                                     .c_str());
+    }
   }
+  LOG_MESSAGE(
+      TRITONSERVER_LOG_INFO, (std::string("Finally: Memory fraction set to ") +
+                              std::to_string(memory_fraction_) +
+                              " for model instance '" + Name() + "'")
+                                 .c_str());
 
   return nullptr;
 }
 
-// The naming convention followed for inputs/outputs in the model configuration.
-// Outputs don't support FORWARD_ARGUMENT.
+// The naming convention followed for inputs/outputs in the model
+// configuration. Outputs don't support FORWARD_ARGUMENT.
 enum class NamingConvention {
   NAMED_INDEX,
   FORWARD_ARGUMENT,
@@ -490,6 +551,8 @@ class ModelInstanceState : public BackendModelInstance {
 
   // Clear CUDA cache
   void ClearCache();
+
+  void SetMemoryFraction();
 
  private:
   ModelInstanceState(
@@ -657,6 +720,7 @@ ModelInstanceState::ClearCache()
 #endif  // TRITON_ENABLE_GPU
 }
 
+
 ModelInstanceState::~ModelInstanceState()
 {
   torch_model_.reset();
@@ -772,8 +836,8 @@ ModelInstanceState::ValidateInputs(const size_t expected_input_cnt)
   // supported. If the model expects more than one input then they must be all
   // be of type Tensor.
   //
-  // Ignore the argument at idx 0 if it is of Class type (self param in forward
-  // function)
+  // Ignore the argument at idx 0 if it is of Class type (self param in
+  // forward function)
   size_t start_idx = 0;
   if ((arguments.size() > 0) &&
       (arguments.at(0).type()->kind() == c10::TypeKind::ClassType)) {
@@ -807,8 +871,8 @@ ModelInstanceState::ValidateInputs(const size_t expected_input_cnt)
       allowed_inputs.emplace_back(arguments.at(i).name());
     }
 
-    // If all inputs are tensors, match number of expected inputs between model
-    // and configuration
+    // If all inputs are tensors, match number of expected inputs between
+    // model and configuration
     if ((arguments.size() - start_idx) != expected_input_cnt) {
       return TRITONSERVER_ErrorNew(
           TRITONSERVER_ERROR_INVALID_ARG,
@@ -975,7 +1039,8 @@ ModelInstanceState::ValidateOutputs()
       if ((dims.size() + (supports_batching_ ? 1 : 0)) > 1) {
         return TRITONSERVER_ErrorNew(
             TRITONSERVER_ERROR_INTERNAL,
-            ("Triton only supports 1 dimensional List of String as output for "
+            ("Triton only supports 1 dimensional List of String as output "
+             "for "
              "'" +
              std::string(io_name) + "' for model '" + model_state_->Name() +
              "'")
@@ -1151,6 +1216,7 @@ ModelInstanceState::ProcessRequests(
           reinterpret_cast<void*>(&compute_infer_start_event_)));
 
   // Run...
+  LOG_MESSAGE(TRITONSERVER_LOG_VERBOSE, (std::string("Running").c_str()));
   if (!all_response_failed) {
     Execute(&responses, request_count, &input_tensors, &output_tensors);
   }
@@ -1312,12 +1378,12 @@ ModelInstanceState::Execute(
         torch::jit::overrideCanFuseOnCPU(false);
         torch::jit::overrideCanFuseOnGPU(false);
         torch::jit::setTensorExprFuserEnabled(false);
-	torch::jit::fuser::cuda::setEnabled(true);
+        torch::jit::fuser::cuda::setEnabled(true);
       } else {
         torch::jit::overrideCanFuseOnCPU(true);
         torch::jit::overrideCanFuseOnGPU(true);
         torch::jit::setTensorExprFuserEnabled(true);
-	torch::jit::fuser::cuda::setEnabled(false);
+        torch::jit::fuser::cuda::setEnabled(false);
       }
     }
 
@@ -1331,7 +1397,16 @@ ModelInstanceState::Execute(
         input_dict.insert(input_index.first, ival.toTensor());
       }
       std::vector<torch::jit::IValue> input_dict_ivalue = {input_dict};
-      model_outputs_ = torch_model_->forward(input_dict_ivalue);
+      LOG_MESSAGE(
+          TRITONSERVER_LOG_INFO, (std::string("Running forward").c_str()));
+      try {
+        model_outputs_ = torch_model_->forward(input_dict_ivalue);
+      }
+      catch (const std::runtime_error& e) {
+        LOG_MESSAGE(
+            TRITONSERVER_LOG_INFO,
+            ("Caught: " + std::string(e.what())).c_str());
+      }
     } else {
       model_outputs_ = torch_model_->forward(*input_tensors);
     }
@@ -1367,8 +1442,10 @@ ModelInstanceState::Execute(
       output_tensors->push_back(model_outputs_);
     } else {
       throw std::invalid_argument(
-          "output must be of type Tensor, List[str] or Tuple containing one of "
-          "these two types. It should not be a List / Dictionary of Tensors or "
+          "output must be of type Tensor, List[str] or Tuple containing one "
+          "of "
+          "these two types. It should not be a List / Dictionary of Tensors "
+          "or "
           "a Scalar");
     }
   }
@@ -1453,10 +1530,12 @@ ModelInstanceState::GetNamingConvention(
             LOG_MESSAGE(
                 TRITONSERVER_LOG_WARN,
                 ("input '" + io_name +
-                 "' or previous input(s) are neither an input argument to the "
+                 "' or previous input(s) are neither an input argument to "
+                 "the "
                  "model '" +
                  model_state_->Name() +
-                 "' nor do they follow the <name>__<index> naming convention. "
+                 "' nor do they follow the <name>__<index> naming "
+                 "convention. "
                  "Falling back to enforcing strict ordering from model "
                  "configuration.")
                     .c_str());
@@ -1761,9 +1840,9 @@ ModelInstanceState::SetInputTensors(
 
         batchn_shape[0] += GetElementCount(input_shape, input_dims_count);
       }
-    }
-    else {
-      batchn_shape = std::vector<int64_t>(input_shape, input_shape + input_dims_count);
+    } else {
+      batchn_shape =
+          std::vector<int64_t>(input_shape, input_shape + input_dims_count);
       if (supports_batching_) {
         batchn_shape[0] = total_batch_size;
       }
@@ -1772,8 +1851,8 @@ ModelInstanceState::SetInputTensors(
     // The input must be in contiguous CPU/GPU memory.
     std::vector<std::pair<TRITONSERVER_MemoryType, int64_t>> alloc_perference;
     if (device_.is_cpu()) {
-      alloc_perference = {{TRITONSERVER_MEMORY_CPU_PINNED, 0},
-                          {TRITONSERVER_MEMORY_CPU, 0}};
+      alloc_perference = {
+          {TRITONSERVER_MEMORY_CPU_PINNED, 0}, {TRITONSERVER_MEMORY_CPU, 0}};
     } else {
       alloc_perference = {{TRITONSERVER_MEMORY_GPU, device_.index()}};
     }
@@ -1887,12 +1966,14 @@ ModelInstanceState::ReadOutputTensors(
 
       // Output tensors may not reside on the same device as model
       torch::Device tensor_device = output_flat.device();
-      const auto memory_type = (tensor_device.type() == torch::kCPU) ? TRITONSERVER_MEMORY_CPU
-                                                  : TRITONSERVER_MEMORY_GPU;
-      const auto memory_id = (tensor_device.type() == torch::kCPU) ? 0 : tensor_device.index();
+      const auto memory_type = (tensor_device.type() == torch::kCPU)
+                                   ? TRITONSERVER_MEMORY_CPU
+                                   : TRITONSERVER_MEMORY_GPU;
+      const auto memory_id =
+          (tensor_device.type() == torch::kCPU) ? 0 : tensor_device.index();
 
-      // Batch output doesn't support string data type yet, as it is not trivial
-      // to parse string output
+      // Batch output doesn't support string data type yet, as it is not
+      // trivial to parse string output
       const BatchOutput* batch_output = StateForModel()->FindBatchOutput(name);
       if (batch_output == nullptr) {
         // Get output shape
@@ -1906,16 +1987,16 @@ ModelInstanceState::ReadOutputTensors(
           return TRITONSERVER_ErrorNew(
               TRITONSERVER_ERROR_INVALID_ARG,
               (std::string("output '") + name +
-              "' is a scalar which is not supported.")
+               "' is a scalar which is not supported.")
                   .c_str());
         }
 
         responder.ProcessTensor(
-            name, output_dtype, batchn_shape, output_buffer,
-            memory_type, memory_id);
+            name, output_dtype, batchn_shape, output_buffer, memory_type,
+            memory_id);
       } else {
         responder.ProcessBatchOutput(
-          name, *batch_output, output_buffer, memory_type, memory_id);
+            name, *batch_output, output_buffer, memory_type, memory_id);
       }
     } else if (output_tensors[op_index].isList()) {
       // Custom handling for string/bytes tensor...
@@ -2040,6 +2121,39 @@ TRITONBACKEND_Initialize(TRITONBACKEND_Backend* backend)
          std::to_string(TRITONBACKEND_API_VERSION_MINOR))
             .c_str());
   }
+  TRITONSERVER_Message* backend_config_message;
+  RETURN_IF_ERROR(
+      TRITONBACKEND_BackendConfig(backend, &backend_config_message));
+
+  const char* buffer;
+  size_t byte_size;
+  RETURN_IF_ERROR(TRITONSERVER_MessageSerializeToJson(
+      backend_config_message, &buffer, &byte_size));
+  LOG_MESSAGE(
+      TRITONSERVER_LOG_INFO,
+      (std::string("backend configuration:\n") + buffer).c_str());
+
+  triton::common::TritonJson::Value backend_config;
+  if (byte_size != 0) {
+    RETURN_IF_ERROR(backend_config.Parse(buffer, byte_size));
+  }
+
+  std::unique_ptr<BackendConfiguration> lconfig(new BackendConfiguration());
+  triton::common::TritonJson::Value cmdline;
+  if (backend_config.Find("cmdline", &cmdline)) {
+    triton::common::TritonJson::Value value;
+    std::string value_str;
+    if (cmdline.Find("gpu-memory-fraction", &value)) {
+      RETURN_IF_ERROR(value.AsString(&value_str));
+      double lvalue;
+      RETURN_IF_ERROR(ParseDoubleValue(value_str, &lvalue));
+      lconfig->gpu_memory_fraction_ = lvalue;
+    }
+  }
+  RETURN_IF_ERROR(TRITONBACKEND_BackendSetState(
+      backend, reinterpret_cast<void*>(lconfig.get())));
+
+  lconfig.release();
 
   return nullptr;  // success
 }
@@ -2186,5 +2300,4 @@ TRITONBACKEND_ModelInstanceExecute(
 }
 
 }  // extern "C"
-
 }}}  // namespace triton::backend::pytorch
