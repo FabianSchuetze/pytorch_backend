@@ -121,6 +121,10 @@ class ModelState : public BackendModel {
   {
     c10::cuda::CUDACachingAllocator::init(1);
     c10::cuda::CUDACachingAllocator::setMemoryFraction(fraction, 0);
+      LOG_MESSAGE(
+          TRITONSERVER_LOG_INFO,
+          (std::string("Memory Fraction ") + std::to_string(fraction) + "'")
+              .c_str());
   }
 
  private:
@@ -490,42 +494,7 @@ ModelState::ParseParameters()
     LOG_MESSAGE(
         TRITONSERVER_LOG_INFO, (std::string("Before memory config")).c_str());
     double memory_fraction = 1.0;
-    err = ParseParameter(params, "MEMORY_FRACTION", &memory_fraction);
-    if (err != nullptr) {
-      if (TRITONSERVER_ErrorCode(err) != TRITONSERVER_ERROR_NOT_FOUND) {
-        return err;
-      } else {
-        LOG_MESSAGE(
-            TRITONSERVER_LOG_INFO,
-            (std::string("Max GPU memory fraction is not specified") +
-             " for model instance '" + Name() + "'")
-                .c_str());
-        TRITONSERVER_ErrorDelete(err);
-      }
-    } else {
-      if ((memory_fraction < 0) or (memory_fraction > 1)) {
-        LOG_MESSAGE(
-            TRITONSERVER_LOG_INFO,
-            (std::string("Memory fraction must be between zero and one "
-                         "(inclusive) but is set to ") +
-             std::to_string(memory_fraction) + " for model instance '" +
-             Name() + "Will clamp to valid interval.'")
-                .c_str());
-      }
-      memory_fraction_ = float(clamp(memory_fraction, 0.0, 1.0));
-      LOG_MESSAGE(
-          TRITONSERVER_LOG_INFO, (std::string("Memory fraction set to ") +
-                                  std::to_string(memory_fraction_) +
-                                  " for model instance '" + Name() + "'")
-                                     .c_str());
-    }
   }
-  LOG_MESSAGE(
-      TRITONSERVER_LOG_INFO, (std::string("Finally: Memory fraction set to ") +
-                              std::to_string(memory_fraction_) +
-                              " for model instance '" + Name() + "'")
-                                 .c_str());
-
   return nullptr;
 }
 
@@ -1411,10 +1380,9 @@ ModelInstanceState::Execute(
       try {
         model_outputs_ = torch_model_->forward(input_dict_ivalue);
       }
-      catch (const std::runtime_error& e) {
-        LOG_MESSAGE(
-            TRITONSERVER_LOG_INFO,
-            ("Caught: " + std::string(e.what())).c_str());
+      catch (const std::runtime_error& ex) {
+	      LOG_MESSAGE(TRITONSERVER_LOG_ERROR, (std::string("Caught exception during inference") + ex.what()).c_str() );
+		      throw;
       }
     } else {
       model_outputs_ = torch_model_->forward(*input_tensors);
